@@ -3,45 +3,36 @@ const cors = require("cors");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
-const mm = require("music-metadata");
 const fsPromises = require("fs/promises");
+const mm = require("music-metadata");
 const wav = require("node-wav");
 const MusicTempo = require("music-tempo");
-const { exec } = require("child_process");
+const Meyda = require("meyda");
 const tmp = require("tmp");
+const { exec } = require("child_process");
 
 const app = express();
 app.use(cors());
 
-// Φάκελος uploads
 const UPLOADS_DIR = path.join(__dirname, "uploads");
 if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 
-// Multer setup
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, UPLOADS_DIR),
   filename: (req, file, cb) => cb(null, Date.now() + path.extname(file.originalname)),
 });
 const upload = multer({ storage });
 
-// Labels (παραμένουν ίδια)
 const LABELS = [
   { label: "Defected", genres: ["House", "Melodic House"] },
   { label: "Toolroom Records", genres: ["Tech House", "House"] },
   { label: "Hot Creations", genres: ["House", "Deep House"] },
 ];
 
-// Fallback genre
-function detectGenre(metaGenre) {
-  if (metaGenre && metaGenre !== "Unknown Genre") return metaGenre;
-  const genres = ["House", "Tech House", "Melodic House", "Deep House"];
-  return genres[Math.floor(Math.random() * genres.length)];
-}
-
-// Μετατροπή σε WAV PCM μόνο αν δεν είναι WAV
+// Convert to WAV
 async function convertToWavIfNeeded(filePath) {
   const ext = path.extname(filePath).toLowerCase();
-  if (ext === ".wav") return filePath; // αν είναι WAV, δεν κάνουμε τίποτα
+  if (ext === ".wav") return filePath;
 
   return new Promise((resolve, reject) => {
     const tmpFile = tmp.tmpNameSync({ postfix: ".wav" });
@@ -52,7 +43,7 @@ async function convertToWavIfNeeded(filePath) {
   });
 }
 
-// Υπολογισμός BPM
+// Detect BPM
 async function detectBPM(filePath) {
   try {
     const wavFile = await convertToWavIfNeeded(filePath);
@@ -62,44 +53,78 @@ async function detectBPM(filePath) {
     const tempo = new MusicTempo(channelData);
     return Math.round(tempo.tempo);
   } catch (err) {
-    console.warn("Could not detect BPM from audio:", err);
+    console.warn("Could not detect BPM:", err);
     return null;
   }
 }
 
-// Upload route
+// Extract audio features (for mood & instruments)
+async function extractAudioFeatures(filePath) {
+  try {
+    const wavFile = await convertToWavIfNeeded(filePath);
+    const buffer = await fsPromises.readFile(wavFile);
+    const audioData = wav.decode(buffer);
+    const signal = audioData.channelData[0];
+
+    const bufferSize = 1024;
+    const features = Meyda.extract(
+      ["rms", "spectralCentroid", "mfcc"],
+      signal.slice(0, bufferSize),
+      { bufferSize, sampleRate: audioData.sampleRate }
+    );
+
+    if (!features) return null;
+
+    const rms = features.rms ?? 0;
+    const mfccMean = features.mfcc ? features.mfcc.reduce((a,b)=>a+b,0)/features.mfcc.length : 0;
+
+    const mood = {
+      Happy: mfccMean > 0 ? 0.7 : 0,
+      Sad: mfccMean <= 0 ? 0.6 : 0,
+      Energetic: rms > 0.05 ? 0.8 : 0,
+      Calm: rms <= 0.05 ? 0.7 : 0
+    };
+
+    const instruments = ["piano", "drums", "guitar"]; // placeholder
+
+    return { mood, instruments };
+  } catch (err) {
+    console.warn("Could not extract features:", err);
+    return null;
+  }
+}
+
+function detectGenre(metaGenre) {
+  if (metaGenre && metaGenre.length) return metaGenre[0];
+  return "Unknown";
+}
+
 app.post("/upload", upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).send("No file uploaded");
 
   try {
     const metadata = await mm.parseFile(req.file.path);
     const title = metadata.common.title?.trim() || "Unknown Title";
-    const metaGenre = metadata.common.genre?.[0] || null;
-
-    // BPM
-    let bpm = metadata.common.bpm;
-    if (!bpm) bpm = await detectBPM(req.file.path);
-
-    // Genre
-    const genre = detectGenre(metaGenre);
-
-    // Duration
+    const genre = detectGenre(metadata.common.genre);
+    const bpm = metadata.common.bpm ?? await detectBPM(req.file.path);
     const duration = metadata.format.duration ? Math.round(metadata.format.duration) : null;
 
-    // Suggested labels
-    const suggestedLabels = LABELS.map((l) => {
-      let match = 0;
-      if (l.genres.includes(genre)) match += 80;
-      return { label: l.label, match };
-    })
-      .filter((l) => l.match > 0)
-      .sort((a, b) => b.match - a.match);
+    const audioFeatures = await extractAudioFeatures(req.file.path);
+    const mood = audioFeatures?.mood || {};
+    const instruments = audioFeatures?.instruments || [];
+
+    const suggestedLabels = LABELS.map(l => ({
+      label: l.label,
+      match: l.genres.includes(genre) ? 80 : 0
+    })).filter(l => l.match > 0);
 
     return res.json({
       filename: req.file.filename,
       title,
       metadata: { bpm, genre, duration },
-      suggestedLabels,
+      mood,
+      instruments,
+      suggestedLabels
     });
   } catch (err) {
     console.error("Metadata error:", err);
@@ -107,10 +132,5 @@ app.post("/upload", upload.single("file"), async (req, res) => {
   }
 });
 
-// Serve uploads
 app.use("/uploads", express.static(UPLOADS_DIR));
-
-// Start server
-const PORT = 5000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-
+app.listen(5000, () => console.log("Server running on port 5000"));
